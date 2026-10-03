@@ -13,9 +13,14 @@ defaults: distillation_math.yaml
 
 # IPC remains the default. TQ additionally requires data_plane.enabled=true,
 # backend=simple and two distinct nodes, each with one GPU worker.
+# max_payload_bytes bounds the logical [1, T, V] FP32 payload (the teacher
+# forward, student receive buffer and loss working set follow it);
+# max_tile_bytes bounds one transport object and its CPU staging — equal by
+# default, so payloads are not split unless max_tile_bytes is lowered.
 xtoken_transport:
   backend: ipc
   max_payload_bytes: 67108864
+  max_tile_bytes: 67108864
   timeout_s: 120.0
 
 distillation:

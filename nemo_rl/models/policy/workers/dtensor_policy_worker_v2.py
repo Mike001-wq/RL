@@ -34,11 +34,14 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.metric_utils import LEARNING_RATE_KEY
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.data_plane.xtoken import (
+    XTOKEN_FP32_ELEMENT_BYTES,
+    XTokenTQManifest,
+    XTokenTQPublishReceipt,
     XTokenTQReceiveResult,
-    XTokenTQReference,
     check_payload_size,
-    fetch_logits,
-    publish_logits,
+    fetch_logit_tile,
+    plan_logit_tiles,
+    publish_logit_tile,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.automodel.checkpoint import (
@@ -998,20 +1001,27 @@ class DTensorPolicyWorkerV2Impl(
         torch.cuda.synchronize()
         return {"per_sample_handles": per_sample_handles, "dp_rank": dp_rank}
 
-    def get_full_logits_tq(
+    def prepare_logits_tq(
         self,
         data: BatchedDataDict[Any],
         *,
         partition_id: str,
         sample_id: str,
         max_payload_bytes: int,
-    ) -> XTokenTQReference:
-        """Forward and publish on the teacher; CUDA handles stay on this node."""
+        max_tile_bytes: int,
+    ) -> XTokenTQManifest:
+        """Forward on the teacher and return the tile manifest; no PUT yet.
+
+        The manifest reaches the driver before the first tile PUT, so a
+        partial publish remains cleanable by explicit row keys. The payload
+        itself stays in this worker's persistent FP32 storage until the
+        paired :meth:`publish_logits_tq` call.
+        """
         if data.size != 1 or self.tp_size != 1 or self.cp_size != 1:
             raise ValueError("xToken TQ requires batch=TP=CP=1")
         _, seq_len = check_sequence_dim(data)
         # Fast-fail on the configured vocab; the padded vocab is only known
-        # after the forward, and publish_logits re-checks the exact shape.
+        # after the forward, and the exact shape is re-checked below.
         check_payload_size(
             seq_len=seq_len,
             vocab_size=self.model_config.vocab_size,
@@ -1023,7 +1033,7 @@ class DTensorPolicyWorkerV2Impl(
         assert self._teacher_ipc_storage is not None
         if self._teacher_ipc_storage is not previous_storage:
             # This export has no CUDA IPC consumer: TQ only reads the CPU
-            # copy. Release its unused refcounter so validation/exit can free
+            # copies. Release its unused refcounter so validation/exit can free
             # the teacher allocation rather than leaving it in IPC limbo.
             ipc_args = handle["payload_ipc"][0]
             ipc_args[_REBUILD_CUDA_TENSOR_ARG_STORAGE_CLASS_INDEX]._release_ipc_counter(
@@ -1032,28 +1042,94 @@ class DTensorPolicyWorkerV2Impl(
                 device=ipc_args[_REBUILD_CUDA_TENSOR_ARG_DEVICE_INDEX],
             )
         seq_len, vocab_size = handle["actual_shape"]
-        return publish_logits(
-            self._require_dp_client(),
-            self._teacher_ipc_storage[0, :1, :seq_len, :vocab_size],
+        check_payload_size(
+            seq_len=seq_len, vocab_size=vocab_size, max_bytes=max_payload_bytes
+        )
+        return XTokenTQManifest(
             partition_id=partition_id,
             sample_id=sample_id,
+            shape=(1, seq_len, vocab_size),
             producer_node_id=ray.get_runtime_context().get_node_id(),
-            max_payload_bytes=max_payload_bytes,
+            tiles=plan_logit_tiles(
+                seq_len=seq_len,
+                vocab_size=vocab_size,
+                max_tile_bytes=max_tile_bytes,
+                partition_id=partition_id,
+                sample_id=sample_id,
+            ),
+        )
+
+    def publish_logits_tq(
+        self, manifest: XTokenTQManifest, *, max_tile_bytes: int
+    ) -> XTokenTQPublishReceipt:
+        """PUT each manifest tile from the prepared payload, one at a time.
+
+        Must be called after :meth:`prepare_logits_tq` produced this manifest
+        on this worker; the driver sequences the two calls back to back. One
+        tile occupies the CPU staging buffer at a time — tiles are never
+        re-assembled into a full CPU copy here.
+        """
+        storage = self._teacher_ipc_storage
+        if (
+            storage is None
+            or storage.ndim != 4
+            or storage.shape[2] < manifest.shape[1]
+            or storage.shape[3] < manifest.shape[2]
+        ):
+            raise ValueError(
+                "xToken TQ publish requires the payload prepared by "
+                "prepare_logits_tq on this worker; the prepared storage is "
+                "missing or smaller than the manifest"
+            )
+        if manifest.producer_node_id != ray.get_runtime_context().get_node_id():
+            raise ValueError("xToken TQ tile manifest was prepared on another node")
+        client = self._require_dp_client()
+        started = time.perf_counter()
+        put_bytes = 0
+        for tile in manifest.tiles:
+            # Stage exactly one contiguous CPU FP32 tile; the buffer is
+            # released when the next iteration rebinds it.
+            tile_payload = torch.empty(tile.shape, dtype=torch.float32, device="cpu")
+            tile_payload.copy_(
+                storage[
+                    0,
+                    0,
+                    tile.seq_start : tile.seq_end,
+                    tile.vocab_start : tile.vocab_end,
+                ]
+            )
+            publish_logit_tile(
+                client,
+                tile_payload,
+                tile=tile,
+                partition_id=manifest.partition_id,
+                max_tile_bytes=max_tile_bytes,
+            )
+            put_bytes += tile.nbytes
+        return XTokenTQPublishReceipt(
+            sample_id=manifest.sample_id,
+            tile_count=len(manifest.tiles),
+            put_bytes=put_bytes,
+            put_seconds=time.perf_counter() - started,
         )
 
     def materialize_full_logits_tq(
-        self, reference: XTokenTQReference, *, max_payload_bytes: int
+        self, manifest: XTokenTQManifest, *, max_tile_bytes: int
     ) -> XTokenTQReceiveResult:
-        """GET into persistent student storage and return student-local IPC."""
+        """GET tiles into persistent student storage and return student-local IPC.
+
+        Tiles are fetched by their explicit row keys in manifest order; each
+        is validated for identity, shape and dtype before its single copy
+        into the receiving buffer. Because the manifest cover is exact, the
+        buffer region is fully overwritten before the descriptor is handed
+        out — an incomplete or failed fetch raises and never reaches the
+        loss, and no previous step's buffer content survives.
+        """
         node_id = ray.get_runtime_context().get_node_id()
-        started = time.perf_counter()
-        logits = fetch_logits(
-            self._require_dp_client(),
-            reference,
-            consumer_node_id=node_id,
-            max_payload_bytes=max_payload_bytes,
-        )
-        _, seq_len, vocab_size = reference.shape
+        if manifest.producer_node_id == node_id:
+            raise ValueError("xToken TQ teacher and student must be on different nodes")
+        _, seq_len, vocab_size = manifest.shape
+        client = self._require_dp_client()
         previous_storage = self._teacher_ipc_storage
         self._teacher_ipc_storage, self._teacher_ipc_handle = ensure_teacher_ipc_buffer(
             self._teacher_ipc_storage,
@@ -1065,7 +1141,17 @@ class DTensorPolicyWorkerV2Impl(
             torch.float32,
             torch.device("cuda", torch.cuda.current_device()),
         )
-        self._teacher_ipc_storage[0, :1, :seq_len, :vocab_size].copy_(logits)
+        started = time.perf_counter()
+        for tile in manifest.tiles:
+            tile_payload = fetch_logit_tile(
+                client,
+                tile,
+                partition_id=manifest.partition_id,
+                max_tile_bytes=max_tile_bytes,
+            )
+            self._teacher_ipc_storage[
+                0, 0, tile.seq_start : tile.seq_end, tile.vocab_start : tile.vocab_end
+            ].copy_(tile_payload)
         torch.cuda.synchronize()
         if self._teacher_ipc_storage is previous_storage:
             # A fresh export supplies one IPC refcounter for this loss call.
@@ -1105,7 +1191,8 @@ class DTensorPolicyWorkerV2Impl(
         return XTokenTQReceiveResult(
             handles=[{"teacher_shards": [handle]}],
             consumer_node_id=node_id,
-            nbytes=reference.nbytes,
+            nbytes=seq_len * vocab_size * XTOKEN_FP32_ELEMENT_BYTES,
+            tile_count=len(manifest.tiles),
             get_seconds=time.perf_counter() - started,
             buffer_bytes=self._teacher_ipc_storage.numel()
             * self._teacher_ipc_storage.element_size(),

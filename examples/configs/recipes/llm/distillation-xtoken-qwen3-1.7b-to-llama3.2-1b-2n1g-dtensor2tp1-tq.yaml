@@ -1,5 +1,8 @@
 defaults: ../../xtoken_off_policy_distillation.yaml
 
+# xtoken_transport.max_tile_bytes inherits max_payload_bytes (single-tile
+# payloads). Lower it (e.g. to 1048576) to split payloads into bounded tiles;
+# this constrains only queue objects and CPU staging, not the GPU working set.
 xtoken_transport:
   backend: tq
 
