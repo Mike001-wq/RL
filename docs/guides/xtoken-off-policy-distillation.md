@@ -310,11 +310,26 @@ The student publishes a local descriptor for its own receive buffer.
 Payloads are bounded by `xtoken_transport.max_payload_bytes` (64 MiB by
 default), pre-checked against the configured vocabulary and padded sequence
 length before inference, then re-checked against the exact padded shape at
-publish time;
-`xtoken_transport.timeout_s` defaults to 120 seconds. Each step uses a new key
-and explicitly clears it after training/evaluation. A transfer or training
-failure stops the workers and aborts the run; optimizer updates are not retried.
-PUT/GET byte metrics count application tensor bytes, excluding network overhead.
+publish time; `xtoken_transport.timeout_s` defaults to 120 seconds.
+
+`xtoken_transport.max_tile_bytes` (default: equal to `max_payload_bytes`)
+bounds one *transport object*: the payload is split into deterministic
+sequence-major tiles (a row is split along the vocabulary axis only when a
+single row exceeds the bound), each PUT and GET is checked against it, and a
+tile that cannot fit fails loudly. Tiling constrains only the objects on the
+queue and their CPU staging — the teacher forward, the student's full receive
+buffer and the loss working set still allocate the complete logits, so
+supporting a larger logical payload requires raising `max_payload_bytes` (and
+the whole GPU budget with it), never lowering `max_tile_bytes` alone.
+
+Each step pre-registers every expected tile ID before the first PUT and uses
+them to clean up exactly those rows after training/evaluation — a partial
+publish or a mid-step failure stops the workers and clears the full expected
+ID set; optimizer updates are not retried. Because killing a producer actor
+does not cancel storage RPCs already in flight, cleanup re-verifies that no
+expected rows remain and fails loudly if a late PUT keeps re-adding them.
+PUT/GET byte metrics count application tensor bytes (the sum of tile bytes),
+excluding network/wire overhead.
 
 On an existing two-node Linux Ray cluster, with the same checkout, dependencies,
 model cache and Llama download access on both nodes, run:
@@ -326,7 +341,11 @@ bash tests/functional/xtoken_tq_two_node.sh
 This uses the `distillation-xtoken-qwen3-1.7b-to-llama3.2-1b-2n1g-dtensor2tp1-tq`
 recipe (sequence limit 64), builds the existing lightweight projection, and
 runs synthetic cross-node/numerical checks followed by 3 and 10 training steps.
-It fails on same-node placement, residual TQ rows or growing receive buffers.
+The synthetic stage forces multi-tile payloads by lowering the tile bound and
+injects missing-tile, partial-publish, timeout and student-exception failures,
+requiring empty partitions after every cleanup. Training runs check per-step
+tile cleanup and bounded receive buffers. It fails on same-node placement,
+residual TQ rows or growing receive buffers.
 OPD/MOPD, Mooncake/GDR, multiple teachers and heterogeneous parallelism are
 outside this first TQ path.
 

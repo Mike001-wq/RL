@@ -54,10 +54,11 @@ from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     xtoken_off_policy_distillation_train,
 )
 from nemo_rl.data_plane.xtoken import (
+    XTokenTQManifest,
     XTokenTQReceiveResult,
-    XTokenTQReference,
     XTokenTQTransport,
     XTokenTransportConfig,
+    plan_logit_tiles,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
@@ -371,13 +372,36 @@ def test_tq_train_and_validation_share_export_and_cleanup(mock_xtoken_components
     t.client = MagicMock()
     t.client.list_sample_ids.return_value = []
     events = []
-    c.teacher_policy.get_full_logits_tq.side_effect = (
-        lambda *_, **kw: XTokenTQReference(
-            kw["partition_id"], kw["sample_id"], (1, 4, 8), "teacher", 0.01
+    c.teacher_policy.prepare_logits_tq.side_effect = lambda data, **kw: (
+        XTokenTQManifest(
+            kw["partition_id"],
+            kw["sample_id"],
+            (1, 4, 8),
+            "teacher",
+            plan_logit_tiles(
+                seq_len=4,
+                vocab_size=8,
+                max_tile_bytes=kw["max_tile_bytes"],
+                partition_id=kw["partition_id"],
+                sample_id=kw["sample_id"],
+            ),
         )
     )
-    c.student_policy.materialize_full_logits_tq.return_value = XTokenTQReceiveResult(
-        [{"teacher_shards": []}], "student", 128, 0.01, 128
+    c.teacher_policy.publish_logits_tq.side_effect = lambda manifest, **kw: MagicMock(
+        sample_id=manifest.sample_id,
+        tile_count=len(manifest.tiles),
+        put_bytes=manifest.nbytes,
+        put_seconds=0.01,
+    )
+    c.student_policy.materialize_full_logits_tq.side_effect = (
+        lambda manifest, **kw: XTokenTQReceiveResult(
+            [{"teacher_shards": []}],
+            "student",
+            manifest.nbytes,
+            len(manifest.tiles),
+            0.01,
+            128,
+        )
     )
     result = c.student_policy.train.return_value
 
@@ -391,8 +415,9 @@ def test_tq_train_and_validation_share_export_and_cleanup(mock_xtoken_components
     t.client.clear_samples.side_effect = lambda *_: events.append("clear")
     _run_train(c, tq_transport=t)
     assert (
-        c.teacher_policy.get_full_logits_tq.call_count == 6
+        c.teacher_policy.prepare_logits_tq.call_count == 6
     )  # two train + four validation batches
+    assert c.teacher_policy.publish_logits_tq.call_count == 6
     assert c.student_policy.materialize_full_logits_tq.call_count == 6
     c.teacher_policy.get_full_logits_ipc.assert_not_called()
     assert events == ["train", "eval", "clear", "eval", "clear", "clear"] * 2
